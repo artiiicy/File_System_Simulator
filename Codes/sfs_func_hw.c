@@ -32,6 +32,33 @@ void dump_directory();
 static struct sfs_super spb;	// superblock
 static struct sfs_dir sd_cwd = { SFS_NOINO }; // current working directory
 
+int search_file(const char *path)
+{
+	int i = 0;
+	struct sfs_inode temp_inode;
+	disk_read(&temp_inode, sd_cwd.sfd_ino);
+	struct sfs_dir temp_dir[SFS_DENTRYPERBLOCK];
+
+	while(temp_inode.sfi_direct[i] != 0)
+	{
+		// block access
+		disk_read(temp_dir, temp_inode.sfi_direct[i]);
+
+		// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
+		int j;
+		for(j = 0; j < SFS_DENTRYPERBLOCK; j++)
+		{
+			// 찾은 경우 : return (inode #)
+			if(!strcmp(temp_dir[j].sfd_name, path))
+				return temp_dir[j].sfd_ino;
+		}
+		i++;
+	}
+
+	// 못찾은 경우 : return 0;
+	return 0;
+}
+
 void error_message(const char *message, const char *path, int error_code) {
 	switch (error_code) {
 	case -1:
@@ -160,50 +187,27 @@ void sfs_cd(const char* path)
 
 		sd_cwd.sfd_ino = temp_dir[0].sfd_ino;
 	}
-
+	
 	// cd [path] : path로 이동하는 경우
 	else
 	{
-		int i = 0;
-		int found_token = 0;
-		struct sfs_inode temp_inode;
-		disk_read(&temp_inode, sd_cwd.sfd_ino);
-		struct sfs_dir temp_dir[SFS_DENTRYPERBLOCK];
+		int found_inode_idx = search_file(path);
 
-		while(temp_inode.sfi_direct[i] != 0 && !found_token)
+		if(found_inode_idx)
 		{
-			// block access
-			disk_read(temp_dir, temp_inode.sfi_direct[i]);
+			struct sfs_inode found_inode;
+			disk_read(&found_inode, found_inode_idx);
 
-			// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
-			int j;
-			for(j = 0; j < SFS_DENTRYPERBLOCK; j++)
-			{
-				struct sfs_inode search_inode;
-				disk_read(&search_inode, temp_dir[j].sfd_ino);
+			// 파일인 경우 : [error] Not a directory
+			if(found_inode.sfi_type == SFS_TYPE_FILE)
+				error_message("cd", path, -2);
 
-				// path와 같은 이름의 폴더 혹은 파일을 찾은 경우
-				if(!strcmp(temp_dir[j].sfd_name, path))
-				{
-					found_token = 1;
-
-					struct sfs_inode found_inode;
-					disk_read(&found_inode, temp_dir[j].sfd_ino);
-
-					// 파일인 경우 : [error] Not a directory
-					if(found_inode.sfi_type == SFS_TYPE_FILE)
-						error_message("cd", path, -2);
-
-					// 폴더인 경우
-					else
-						sd_cwd.sfd_ino = temp_dir[j].sfd_ino;
-				}
-			}
-			i++;
+			// 폴더인 경우
+			else
+				sd_cwd.sfd_ino = found_inode_idx;
 		}
 
-		// path와 같은 이름 못찾은 경우 : [error] No such file or directory
-		if(!found_token)
+		else
 			error_message("cd", path, -1);
 	}
 }
@@ -323,6 +327,25 @@ void sfs_ls(const char* path)
 
 void sfs_mkdir(const char* org_path) 
 {
+	struct sfs_inode temp_inode;
+	disk_read(&temp_inode, sd_cwd.sfd_ino);
+
+	// dir entry가 꽉 찬 경우 : [error] NO BLOCK AVAILABLE? DIRECTORY FULL? 에러메시지와 뒤의 비교하는 것도 불확실함.
+	if(temp_inode.sfi_size/sizeof(struct sfs_dir) == SFS_DENTRYPERBLOCK * SFS_NDIRECT)
+		error_message("mkdir", org_path, -3);
+
+	else
+	{
+		// 이미 해당 path가 존재하는 경우 : [error] Already exists
+		if(search_file(org_path))
+			error_message("mkdir", org_path, -6);
+
+		else
+		{
+
+		}
+	}
+
 	printf("Not Implemented\n");
 }
 
@@ -333,7 +356,46 @@ void sfs_rmdir(const char* org_path)
 
 void sfs_mv(const char* src_name, const char* dst_name) 
 {
-	printf("Not Implemented\n");
+	int found_inode_idx = search_file(src_name);
+
+	// 존재하지 않는 파일명을 바꾸려는 경우 : [error] No such file or directory
+	if(!found_inode_idx)
+		error_message("mv", src_name, -1);
+
+	// 이미 존재하는 파일명으로 바꾸려는 경우 : [error] Already exists
+	else if(search_file(dst_name))
+		error_message("mv", dst_name, -6);
+
+	else
+	{
+		int i = 0;
+		int found_token = 0;
+		struct sfs_inode temp_inode;
+		disk_read(&temp_inode, sd_cwd.sfd_ino);
+		struct sfs_dir temp_dir[SFS_DENTRYPERBLOCK];
+
+		while(temp_inode.sfi_direct[i] != 0 && !found_token)
+		{
+			// block access
+			disk_read(temp_dir, temp_inode.sfi_direct[i]);
+
+			// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
+			int j;
+			for(j = 0; j < SFS_DENTRYPERBLOCK; j++)
+			{
+				// 찾은 경우 이름 변경
+				if(!strcmp(temp_dir[j].sfd_name, src_name))
+				{
+					strcpy(temp_dir[j].sfd_name, dst_name);
+					disk_write(temp_dir, temp_inode.sfi_direct[i]);
+
+					found_token = 1;
+					break;
+				}
+			}
+			i++;
+		}	
+	}
 }
 
 void sfs_rm(const char* path) 
