@@ -186,11 +186,55 @@ void sfs_cd(const char* path)
 		disk_read(temp_dir, temp_inode.sfi_direct[0]);
 
 		sd_cwd.sfd_ino = temp_dir[0].sfd_ino;
+		strncpy(sd_cwd.sfd_name, temp_dir[0].sfd_name, SFS_NAMELEN);
 	}
 	
 	// cd [path] : path로 이동하는 경우
 	else
 	{
+		int found_inode_idx = 0;
+		int i = 0;
+		struct sfs_inode temp_inode;
+		disk_read(&temp_inode, sd_cwd.sfd_ino);
+		struct sfs_dir temp_dir[SFS_DENTRYPERBLOCK];
+
+		while(temp_inode.sfi_direct[i] != 0 && !found_inode_idx)
+		{
+			// block access
+			disk_read(temp_dir, temp_inode.sfi_direct[i]);
+
+			// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
+			int j;
+			for(j = 0; j < SFS_DENTRYPERBLOCK && !found_inode_idx; j++)
+			{
+				// 찾은 경우
+				if(!strcmp(temp_dir[j].sfd_name, path))
+				{
+					found_inode_idx = temp_dir[j].sfd_ino;
+
+					struct sfs_inode found_inode;
+					disk_read(&found_inode, found_inode_idx);
+
+					// 파일인 경우 : [error] Not a directory
+					if(found_inode.sfi_type == SFS_TYPE_FILE)
+						error_message("cd", path, -2);
+
+					// 폴더인 경우
+					else
+					{
+						sd_cwd.sfd_ino = found_inode_idx;
+						strncpy(sd_cwd.sfd_name, temp_dir[j].sfd_name, SFS_NAMELEN);
+					}
+				}
+			}
+			i++;
+		}
+
+		// 못 찾은 경우 : [error] No such file or directory
+		if(!found_inode_idx)
+			error_message("cd", path, -1);
+		/*
+		
 		int found_inode_idx = search_file(path);
 
 		if(found_inode_idx)
@@ -204,11 +248,15 @@ void sfs_cd(const char* path)
 
 			// 폴더인 경우
 			else
+			{
 				sd_cwd.sfd_ino = found_inode_idx;
+				strncpy(sd_cwd.sfd_name, path, SFS_NAMELEN);
+			}
 		}
 
 		else
 			error_message("cd", path, -1);
+		*/
 	}
 }
 
@@ -230,7 +278,6 @@ void sfs_ls(const char* path)
 	if(path == NULL)
 	{
 		// inode의 sfi_direct배열 출력
-		printf("**************************************************************************\n");
 		int j = 0;
 		while(temp_inode.sfi_direct[j] != 0)
 		{
@@ -260,13 +307,11 @@ void sfs_ls(const char* path)
 			j++;
 		}
 		printf("\n");
-		printf("**************************************************************************\n");
 	}
 
 	// ls [path] : 경로를 사용한 경우로 경로의 하위 폴더 및 파일 출력.
 	else
 	{
-		printf("**************************************************************************\n");
 		int j = 0;
 		int found_token = 0;
 		while(temp_inode.sfi_direct[j] != 0 && !found_token)
@@ -338,11 +383,10 @@ void sfs_ls(const char* path)
 
 		else
 			printf("\n");
-		printf("**************************************************************************\n");		
 	}
 }
 
-void sfs_mkdir(const char* org_path) 
+void sfs_mkdir(const char* org_path)
 {
 	struct sfs_inode parent_inode;
 	disk_read(&parent_inode, sd_cwd.sfd_ino);
@@ -406,16 +450,17 @@ void sfs_mkdir(const char* org_path)
 		{
 			// 부모 노드의 dir entry에 추가해주기
 			// block 추가할 각 idx 계산하기
-			printf("size : %d\n", parent_inode.sfi_size);
-			int inode_direct_idx = parent_inode.sfi_size / 512;
-			int direct_entry_idx = (parent_inode.sfi_size - inode_direct_idx * 512) / 64;
+			int inode_direct_idx = parent_inode.sfi_size / SFS_BLOCKSIZE;
+			int direct_entry_idx = (parent_inode.sfi_size - inode_direct_idx * SFS_BLOCKSIZE) / sizeof(struct sfs_dir);
+			
+			
 			
 			/*
 			printf("inode ptr index : %d\n", inode_direct_idx);
 			printf("dir index : %d\n", direct_entry_idx);
 
 			struct sfs_dir test_dir[SFS_DENTRYPERBLOCK];
-			disk_read(test_dir, parent_inode.sfi_direct[0]);
+			disk_read(test_dir, parent_inode.sfi_direct[inode_direct_idx]);
 			int q;
 			printf("-----------------\n");
 			for(q = 0; q < 8; q++)
@@ -425,10 +470,58 @@ void sfs_mkdir(const char* org_path)
 			printf("-----------------\n");
 			*/
 
+			// 새로운 dir ptr를 배정해야 하는 경우
+			if(parent_inode.sfi_size % 512 == 0)
+			{
+				// bitmap에서 0인 block idx 찾아서 1로 만든다.
+				int temp_idx = 0;
+				int count = 0;
+				int i;
+				for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !temp_idx; i++)
+				{
+					disk_read(temp_bit, 2 + i);
+					int j;
+					for(j = 0; j < 512 && count < spb.sp_nblocks && !temp_idx; j++)
+					{
+						int k;
+						for(k = 0; k < 8 && count < spb.sp_nblocks && !temp_idx; k++)
+						{
+							if(count == free_idx[1] + 1)
+							{
+								temp_idx = count;
+								BIT_SET(temp_bit[j], k);
+								disk_write(temp_bit, 2 + i);
+
+								int temp = temp_idx;
+								temp_idx = free_idx[0];
+								free_idx[0] = free_idx[1];
+								free_idx[1] = temp;
+							}
+							count++;
+						}
+					}
+				}
+
+				// 찾은 block idx를 새로운 dir ptr block으로 할당
+				parent_inode.sfi_direct[inode_direct_idx] = temp_idx;
+				disk_write(&parent_inode, sd_cwd.sfd_ino);
+			}
+
 			struct sfs_dir new_dir[SFS_DENTRYPERBLOCK];	// 새로운 dir entry 할당할 변수
 			disk_read(new_dir, parent_inode.sfi_direct[inode_direct_idx]);
 			new_dir[direct_entry_idx].sfd_ino = free_idx[0];	// inode 할당
-			strcpy(new_dir[direct_entry_idx].sfd_name, org_path);	// dir 이름 할당
+			strncpy(new_dir[direct_entry_idx].sfd_name, org_path, SFS_NAMELEN);	// dir 이름 할당
+
+			if(parent_inode.sfi_size % 512 == 0)
+			{
+				int s;
+				for(s = 1; s < 8; s++)
+				{
+					bzero(&new_dir[direct_entry_idx + s], sizeof(struct sfs_dir));
+					//new_dir[direct_entry_idx + s].sfd_ino = SFS_NOINO;
+					//strcpy(new_dir[direct_entry_idx + s].sfd_name, '\0');
+				}
+			}
 			disk_write(new_dir, parent_inode.sfi_direct[inode_direct_idx]);
 
 			/*
@@ -459,7 +552,7 @@ void sfs_mkdir(const char* org_path)
 			// 빈 block의 idx로 dir block 할당 및 초기화
 			struct sfs_dir new_dir_block[SFS_DENTRYPERBLOCK];	// 새로운 dir 블록 할당할 변수
 			disk_read(new_dir_block, new_inode.sfi_direct[0]);
-			new_dir_block[0].sfd_ino = free_idx[0];	// ? : 자기 inode idx 
+			new_dir_block[0].sfd_ino = free_idx[0];	// 자기 inode idx 
 			strncpy( new_dir_block[0].sfd_name, ".", SFS_NAMELEN );
 			new_dir_block[1].sfd_ino = sd_cwd.sfd_ino;	// .. : 부모 inode idx
 			strncpy( new_dir_block[1].sfd_name, "..", SFS_NAMELEN );
@@ -468,9 +561,11 @@ void sfs_mkdir(const char* org_path)
 			int i;
 			for(i = 2; i < SFS_DENTRYPERBLOCK; i++)
 			{
-				new_dir_block[i].sfd_ino = SFS_NOINO;
+				bzero(&new_dir_block[i], sizeof(struct sfs_dir));
+				//new_dir_block[i].sfd_ino = SFS_NOINO;
+				//strcpy(new_dir[i].sfd_name, '\0');
 			}
-			disk_write(&new_dir_block, new_inode.sfi_direct[0]);
+			disk_write(new_dir_block, new_inode.sfi_direct[0]);
 
 			// 할당 받은 나머지 dir block entry 모두 SFS_NOINO로 초기화
 			for(i = 1; i < SFS_NDIRECT; i++)
@@ -480,7 +575,11 @@ void sfs_mkdir(const char* org_path)
 
 				int j;
 				for(j = 1; j < SFS_DENTRYPERBLOCK; j++)
-					temp_block[j].sfd_ino = SFS_NOINO;
+				{
+					bzero(&temp_block[j], sizeof(struct sfs_dir));
+					//temp_block[j].sfd_ino = SFS_NOINO;
+					//strcpy(temp_block[j].sfd_name, '\0');
+				}
 				disk_write(temp_block, new_inode.sfi_direct[i]);
 			}
 			
@@ -520,15 +619,125 @@ void sfs_mkdir(const char* org_path)
 			}
 		}
 	}
-	printf("Not Implemented\n");
 }
 
 void sfs_rmdir(const char* org_path) 
 {
+	int found_inode_idx = 0;
+	int i = 0;
+	struct sfs_inode parent_inode;
+	disk_read(&parent_inode, sd_cwd.sfd_ino);
+	struct sfs_dir parent_dir[SFS_DENTRYPERBLOCK];
+
+	while(parent_inode.sfi_direct[i] != 0 && !found_inode_idx)
+	{
+		// block access
+		disk_read(parent_dir, parent_inode.sfi_direct[i]);
+
+		// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
+		int j;
+		for(j = 0; j < SFS_DENTRYPERBLOCK && !found_inode_idx; j++)
+		{
+			// 찾은 경우
+			if(!strcmp(parent_dir[j].sfd_name, org_path))
+			{
+				found_inode_idx = parent_dir[j].sfd_ino;
+
+				struct sfs_inode found_inode;
+				disk_read(&found_inode, found_inode_idx);
+
+				// 파일인 경우 : [error] Not a directory
+				if(found_inode.sfi_type == SFS_TYPE_FILE)
+					error_message("rmdir", org_path, -2);
+
+				// 폴더인 경우
+				else
+				{
+					struct sfs_inode found_inode;
+					disk_read(&found_inode, parent_dir[j].sfd_ino);
+
+					// 빈 디렉토리가 아닌 경우 : [error] Directory not empty
+					if(found_inode.sfi_size != sizeof(struct sfs_dir) * 2)
+					{
+						error_message("rmdir", org_path, -7);
+						return;
+					}
+
+					else
+					{
+						// 찾은 폴더의 dir block 초기화
+						int found_dir_idx = found_inode.sfi_direct[0];
+
+						struct sfs_dir found_dir[SFS_DENTRYPERBLOCK];
+						disk_read(found_dir, found_dir_idx);
+
+						bzero(found_dir, SFS_BLOCKSIZE);
+
+						disk_write(found_dir, found_dir_idx);
+
+						// 찾은 폴더의 inode block 초기화
+						bzero(&found_inode, SFS_BLOCKSIZE);
+						disk_write(&found_inode, found_inode_idx);
+						
+						// 부모 노드의 dir entry에서 삭제
+						bzero(&parent_dir[j], sizeof(struct sfs_dir));
+						disk_write(parent_dir, parent_inode.sfi_direct[i]);
+
+						// 부모 노드의 size 재조정
+						parent_inode.sfi_size -= sizeof(struct sfs_dir);
+						disk_write(&parent_inode, sd_cwd.sfd_ino);
+
+
+						// bitmap 수정
+						char temp_bit[SFS_BLOCKSIZE];
+						int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+						int temp_token = 0;
+						num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);	
+
+						int count = 0;
+						for(i = 0; i < num_bitmap && count < spb.sp_nblocks && temp_token != 2; i++)
+						{
+							disk_read(temp_bit, 2 + i);
+							int j;
+							for(j = 0; j < 512 && count < spb.sp_nblocks && temp_token != 2; j++)
+							{
+								int k;
+								for(k = 0; k < 8 && count < spb.sp_nblocks && temp_token != 2; k++)
+								{
+									if(count == found_inode_idx)
+									{
+										BIT_CLEAR(temp_bit[j], k);
+										disk_write(temp_bit, 2 + i);
+										temp_token++;
+									}
+
+									else if(count == found_dir_idx)
+									{
+										BIT_CLEAR(temp_bit[j], k);
+										disk_write(temp_bit, 2 + i);
+										temp_token++;
+									}
+
+									count++;
+								}
+							}
+						}
+
+					}
+				}
+			}
+		}
+		i++;
+	}
+
+	// 못 찾은 경우 : [error] No such file or directory
+	if(!found_inode_idx)
+		error_message("rmdir", org_path, -1);
+
 	printf("Not Implemented\n");
 }
 
-void sfs_mv(const char* src_name, const char* dst_name) 
+void sfs_mv(const char* src_name, const char* dst_name) // strcpy? strncpy??/ strncpy하면 diff 통과 못함
 {
 	int found_inode_idx = search_file(src_name);
 
@@ -560,7 +769,9 @@ void sfs_mv(const char* src_name, const char* dst_name)
 				// 찾은 경우 이름 변경
 				if(!strcmp(temp_dir[j].sfd_name, src_name))
 				{
+					//strncpy(temp_dir[j].sfd_name, dst_name, SFS_NAMELEN);
 					strcpy(temp_dir[j].sfd_name, dst_name);
+
 					disk_write(temp_dir, temp_inode.sfi_direct[i]);
 
 					found_token = 1;
@@ -572,9 +783,89 @@ void sfs_mv(const char* src_name, const char* dst_name)
 	}
 }
 
-void sfs_rm(const char* path) 
+void sfs_rm(const char* path) //touch 구현하고 확인해야할듯..?
 {
-	printf("Not Implemented\n");
+	int rm_idx = 0;
+	int found_token = 0;
+	int i = 0;
+	struct sfs_inode temp_inode;
+	disk_read(&temp_inode, sd_cwd.sfd_ino);
+	struct sfs_dir temp_dir[SFS_DENTRYPERBLOCK];
+
+	while(temp_inode.sfi_direct[i] != 0 && !found_token)
+	{
+		// block access
+		disk_read(temp_dir, temp_inode.sfi_direct[i]);
+
+		// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
+		int j;
+		for(j = 0; j < SFS_DENTRYPERBLOCK && !found_token; j++)
+		{
+			// 찾은 경우
+			if(!strcmp(temp_dir[j].sfd_name, path))
+			{
+				struct sfs_inode is_if_file;
+				disk_read(&is_if_file, temp_dir[j].sfd_ino);
+
+				// file인 경우 dir entry에서 삭제
+				if(is_if_file.sfi_type == SFS_TYPE_FILE)
+				{
+					found_token = 1;
+					rm_idx = temp_dir[j].sfd_ino;
+					temp_dir[j].sfd_ino = 0;
+					//temp_dir[j].sfd_name = "";
+					disk_write(temp_dir, temp_inode.sfi_direct[i]);
+				}
+
+				// dir인 경우 : [error] Is a directory
+				else
+				{
+					error_message("rm", path, -9);
+					return;
+				}
+			}
+		}
+		i++;
+	}
+
+	if(found_token)
+	{
+		//bitmap 해제
+		char temp_bit[SFS_BLOCKSIZE];
+		int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+		num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
+
+		int temp_token = 0;
+		int count = 0;
+		for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !temp_token; i++)
+		{
+			disk_read(temp_bit, 2 + i);
+			int j;
+			for(j = 0; j < 512 && count < spb.sp_nblocks && !temp_token; j++)
+			{
+				int k;
+				for(k = 0; k < 8 && count < spb.sp_nblocks && !temp_token; k++)
+				{
+					if(count == rm_idx)
+					{
+						BIT_CLEAR(temp_bit[j], k);
+						temp_token = 1;
+						disk_write(temp_bit, 2 + i);
+					}
+					count++;
+				}
+			}
+		}
+
+		//inode 삭제
+		struct sfs_inode rm_inode;
+		disk_read(&rm_inode, rm_idx);
+		rm_inode.sfi_type = SFS_TYPE_INVAL;
+		disk_write(&rm_inode, rm_idx);
+	}
+
+	else
+		error_message("rm", path, -1);
 }
 
 void sfs_cpin(const char* local_path, const char* path) 
