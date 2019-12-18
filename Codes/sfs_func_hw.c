@@ -138,6 +138,13 @@ void sfs_touch(const char* path)
 	//for consistency
 	assert( si.sfi_type == SFS_TYPE_DIR );
 
+	//there is already exists file which name is path : [error] 
+	if(search_file(path))
+	{
+		error_message("touch", path, -6);
+		return;
+	}
+
 	//we assume that cwd is the root directory and root directory is empty which has . and .. only
 	//unused DISK2.img satisfy these assumption
 	//for new directory entry(for new file), we use cwd.sfi_direct[0] and offset 2
@@ -148,30 +155,171 @@ void sfs_touch(const char* path)
 	//
 	//if used DISK2.img is used, result is not defined
 	
-	//buffer for disk read
-	struct sfs_dir sd[SFS_DENTRYPERBLOCK];
+	char temp_bit[SFS_BLOCKSIZE];
+	int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+	num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
 
-	//block access
-	disk_read( sd, si.sfi_direct[0] );
+	// find idx for new i-node block AND set bitmap
+	int count = 0;
+	int new_idx = 0;
+	int i;
+	for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !new_idx; i++)
+	{
+		disk_read(temp_bit, 2 + i);
+		int j;
+		for(j = 0; j < 512 && count < spb.sp_nblocks && !new_idx; j++)
+		{
+			int k;
+			for(k = 0; k < 8 && count < spb.sp_nblocks && !new_idx; k++)
+			{
+				if(!BIT_CHECK(temp_bit[j], k))
+				{
+					new_idx = count;
+					BIT_SET(temp_bit[j], k);
+					disk_write(temp_bit, 2 + i);
+				}
+				count++;
+			}
+		}
+	}
 
-	//allocate new block
-	int newbie_ino = 6;
+	// Disk Block이 꽉 찬 경우 : [error] No block available
+	if(!new_idx)
+	{
+		error_message("touch", path, -4);
+		return;
+	}
 
-	sd[2].sfd_ino = newbie_ino;
-	strncpy( sd[2].sfd_name, path, SFS_NAMELEN );
+	// Direct Entry가 꽉 찬 경우	: [error] Directory full
+	else if(si.sfi_size/sizeof(struct sfs_dir) == SFS_DENTRYPERBLOCK * SFS_NDIRECT)
+	{
+		error_message("touch", path, -3);
 
-	disk_write( sd, si.sfi_direct[0] );
+		// find idx for new i-node block AND set bitmap
+		int count = 0;
+		int i;
+		for(i = 0; i < num_bitmap && count < spb.sp_nblocks; i++)
+		{
+			disk_read(temp_bit, 2 + i);
+			int j;
+			for(j = 0; j < 512 && count < spb.sp_nblocks; j++)
+			{
+				int k;
+				for(k = 0; k < 8 && count < spb.sp_nblocks; k++)
+				{
+					if(count == new_idx)
+					{
+						BIT_CLEAR(temp_bit[j], k);
+						disk_write(temp_bit, 2 + i);
+						return;
+					}
+					count++;
+				}
+			}
+		}
+	}
 
-	si.sfi_size += sizeof(struct sfs_dir);
-	disk_write( &si, sd_cwd.sfd_ino );
+	else
+	{
+		// block 추가할 각 idx 계산하기
+		int inode_direct_idx = si.sfi_size / SFS_BLOCKSIZE;
+		int direct_entry_idx = (si.sfi_size - inode_direct_idx * SFS_BLOCKSIZE) / sizeof(struct sfs_dir);
 
-	struct sfs_inode newbie;
+		// 새로운 dir ptr를 배정해야 하는 경우
+		if(si.sfi_size % 512 == 0)
+		{
+			// bitmap에서 0인 block idx 찾아서 1로 만든다.
+			int count = 0;
+			int temp_idx = 0;
+			int i;
+			for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !temp_idx; i++)
+			{
+				disk_read(temp_bit, 2 + i);
+				int j;
+				for(j = 0; j < 512 && count < spb.sp_nblocks && !temp_idx; j++)
+				{
+					int k;
+					for(k = 0; k < 8 && count < spb.sp_nblocks && !temp_idx; k++)
+					{
+						if(!BIT_CHECK(temp_bit[j], k))
+						{
+							temp_idx = count;
+							BIT_SET(temp_bit[j], k);
+							disk_write(temp_bit, 2 + i);
+						}
+						count++;
+					}
+				}
+			}
 
-	bzero(&newbie,SFS_BLOCKSIZE); // initalize sfi_direct[] and sfi_indirect
-	newbie.sfi_size = 0;
-	newbie.sfi_type = SFS_TYPE_FILE;
+			// block 추가 할당이 안되는 경우 fail : [error] No block available
+			if(!temp_idx)
+			{
+				error_message("touch", path, -4);
 
-	disk_write( &newbie, newbie_ino );
+				int count = 0;
+				int new_idx = 0;
+				int i;
+				for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !new_idx; i++)
+				{
+					disk_read(temp_bit, 2 + i);
+					int j;
+					for(j = 0; j < 512 && count < spb.sp_nblocks && !new_idx; j++)
+					{
+						int k;
+						for(k = 0; k < 8 && count < spb.sp_nblocks && !new_idx; k++)
+						{
+							if(count == new_idx)
+							{
+								BIT_CLEAR(temp_bit[j], k);
+								disk_write(temp_bit, 2 + i);
+								return;
+							}
+							count++;
+						}
+					}
+				}
+			}
+
+			// 새로 할당한 dir inode에 쓰기
+			si.sfi_direct[inode_direct_idx] = temp_idx;
+			disk_write(&si, sd_cwd.sfd_ino);
+		}
+
+		//buffer for disk read
+		struct sfs_dir sd[SFS_DENTRYPERBLOCK];
+
+		//block access /////////////
+		disk_read( sd, si.sfi_direct[inode_direct_idx] );
+
+		//allocate new block
+		int newbie_ino = new_idx;
+
+		sd[direct_entry_idx].sfd_ino = newbie_ino;
+		strncpy( sd[direct_entry_idx].sfd_name, path, SFS_NAMELEN );
+
+		// 새로 dir ptr배정한 경우 나머지 0으로 초기화
+		if(si.sfi_size % 512 == 0)
+		{
+			int s;
+			for(s = 1; s < 8; s++)
+			{
+				bzero(&sd[direct_entry_idx + s], sizeof(struct sfs_dir));
+			}
+		}
+		disk_write( sd, si.sfi_direct[inode_direct_idx] );
+
+		si.sfi_size += sizeof(struct sfs_dir);
+		disk_write( &si, sd_cwd.sfd_ino );
+
+		struct sfs_inode newbie;
+
+		bzero(&newbie,SFS_BLOCKSIZE); // initalize sfi_direct[] and sfi_indirect
+		newbie.sfi_size = 0;
+		newbie.sfi_type = SFS_TYPE_FILE;
+
+		disk_write( &newbie, newbie_ino );
+	}
 }
 
 void sfs_cd(const char* path)
@@ -279,30 +427,33 @@ void sfs_ls(const char* path)
 	{
 		// inode의 sfi_direct배열 출력
 		int j = 0;
-		while(temp_inode.sfi_direct[j] != 0)
+		while(j < SFS_NDIRECT)
 		{
-			// block access
-			disk_read(temp_dir, temp_inode.sfi_direct[j]);
-
-			// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 출력
-			int i;
-			for(i = 0; i < SFS_DENTRYPERBLOCK; i++)
+			if(temp_inode.sfi_direct[j] != 0)
 			{
-				struct sfs_inode loop_inode;
-				disk_read(&loop_inode, temp_dir[i].sfd_ino);
-				if (loop_inode.sfi_type == SFS_TYPE_DIR)
+				// block access
+				disk_read(temp_dir, temp_inode.sfi_direct[j]);
+
+				// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 출력
+				int i;
+				for(i = 0; i < SFS_DENTRYPERBLOCK; i++)
 				{
-					strcat(temp_dir[i].sfd_name, "/");
-					printf("%-8s", temp_dir[i].sfd_name);
+					struct sfs_inode loop_inode;
+					disk_read(&loop_inode, temp_dir[i].sfd_ino);
+					if (loop_inode.sfi_type == SFS_TYPE_DIR)
+					{
+						strcat(temp_dir[i].sfd_name, "/");
+						printf("%-8s", temp_dir[i].sfd_name);
+					}
+					else if (loop_inode.sfi_type == SFS_TYPE_FILE)
+						printf("%-8s", temp_dir[i].sfd_name);
+
+					else
+						continue;
+
+					if(strlen(temp_dir[i].sfd_name) >= 8)
+						printf("     ");
 				}
-				else if (loop_inode.sfi_type == SFS_TYPE_FILE)
-					printf("%-8s", temp_dir[i].sfd_name);
-
-				else
-					break;
-
-				if(strlen(temp_dir[i].sfd_name) >= 8)
-					printf("     ");
 			}
 			j++;
 		}
@@ -314,66 +465,74 @@ void sfs_ls(const char* path)
 	{
 		int j = 0;
 		int found_token = 0;
-		while(temp_inode.sfi_direct[j] != 0 && !found_token)
+		//while(temp_inode.sfi_direct[j] != 0 && !found_token)
+
+		while(j < SFS_NDIRECT)
 		{
-			// block access
-			disk_read(temp_dir, temp_inode.sfi_direct[j]);
-
-			// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 출력
-			int i;
-			for(i = 0; i < SFS_DENTRYPERBLOCK; i++)
+			if(temp_inode.sfi_direct[j] != 0 && !found_token)
 			{
-				struct sfs_inode search_inode;
-				disk_read(&search_inode, temp_dir[i].sfd_ino);
+				// block access
+				disk_read(temp_dir, temp_inode.sfi_direct[j]);
 
-				// path와 같은 이름의 dir 혹은 file을 찾은 경우
-				if(!strcmp(temp_dir[i].sfd_name, path))
+				// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 출력
+				int i;
+				for(i = 0; i < SFS_DENTRYPERBLOCK; i++)
 				{
-					found_token = 1;
-					
-					struct sfs_inode found_inode;
-					disk_read(&found_inode, temp_dir[i].sfd_ino);
+					struct sfs_inode search_inode;
+					disk_read(&search_inode, temp_dir[i].sfd_ino);
 
-					// path가 dir인 경우
-					if(found_inode.sfi_type == SFS_TYPE_DIR)
+					// path와 같은 이름의 dir 혹은 file을 찾은 경우
+					if(!strcmp(temp_dir[i].sfd_name, path) && temp_dir[i].sfd_ino)
 					{
-						struct sfs_dir found_dir[SFS_DENTRYPERBLOCK];
+						found_token = 1;
+						
+						struct sfs_inode found_inode;
+						disk_read(&found_inode, temp_dir[i].sfd_ino);
 
-						int k = 0;
-						while(found_inode.sfi_direct[k] != 0)
+						// path가 dir인 경우
+						if(found_inode.sfi_type == SFS_TYPE_DIR)
 						{
-							disk_read(found_dir, found_inode.sfi_direct[k]);
+							struct sfs_dir found_dir[SFS_DENTRYPERBLOCK];
 
-							int l;
-							for(l = 0; l < SFS_DENTRYPERBLOCK; l++)
+							int k = 0;
+							while(k < SFS_DENTRYPERBLOCK)
 							{
-								struct sfs_inode loop_inode;
-								disk_read(&loop_inode, found_dir[l].sfd_ino);
-								if (loop_inode.sfi_type == SFS_TYPE_DIR)
+								if(found_inode.sfi_direct[k] != 0)
 								{
-									strcat(found_dir[l].sfd_name, "/");
-									printf("%-8s", found_dir[l].sfd_name);
+									disk_read(found_dir, found_inode.sfi_direct[k]);
+									int l;
+									for(l = 0; l < SFS_DENTRYPERBLOCK; l++)
+									{
+										struct sfs_inode loop_inode;
+										disk_read(&loop_inode, found_dir[l].sfd_ino);
+										if (loop_inode.sfi_type == SFS_TYPE_DIR)
+										{
+											strcat(found_dir[l].sfd_name, "/");
+											printf("%-8s", found_dir[l].sfd_name);
+										}
+										else if (loop_inode.sfi_type == SFS_TYPE_FILE)
+											printf("%-8s", found_dir[l].sfd_name);
+
+										else
+											continue;
+
+										if(strlen(found_dir[l].sfd_name) >= 8)
+											printf("     ");
+									}
 								}
-								else if (loop_inode.sfi_type == SFS_TYPE_FILE)
-									printf("%-8s", found_dir[l].sfd_name);
-
-								else
-									break;
-
-								if(strlen(found_dir[l].sfd_name) >= 8)
-									printf("     ");
+								k++;
 							}
-							k++;
 						}
-					}
 
-					// path가 file인 경우
-					else
-					{
-						printf("%s", temp_dir[i].sfd_name);						
+						// path가 file인 경우
+						else
+						{
+							printf("%s", temp_dir[i].sfd_name);						
+						}
 					}
 				}
 			}
+			
 			j++;
 		}
 
@@ -433,18 +592,27 @@ void sfs_mkdir(const char* org_path)
 	}
 
 	// Disk Block이 꽉 찬 경우 : [error] No block available
-	if(!free_idx[0])
+	if(!free_idx[0] || !free_idx[1])
+	{
 		error_message("mkdir", org_path, -4);
+		return;
+	}
 
 	// Direct Entry가 꽉 찬 경우	: [error] Directory full
 	else if(parent_inode.sfi_size/sizeof(struct sfs_dir) == SFS_DENTRYPERBLOCK * SFS_NDIRECT)
+	{
 		error_message("mkdir", org_path, -3);
+		return;
+	}
 
 	else
 	{
 		// 이미 해당 path가 존재하는 경우 : [error] Already exists
 		if(search_file(org_path))
+		{
 			error_message("mkdir", org_path, -6);
+			return;
+		}
 
 		else
 		{
@@ -473,38 +641,141 @@ void sfs_mkdir(const char* org_path)
 			// 새로운 dir ptr를 배정해야 하는 경우
 			if(parent_inode.sfi_size % 512 == 0)
 			{
-				// bitmap에서 0인 block idx 찾아서 1로 만든다.
-				int temp_idx = 0;
+				char temp_bit[SFS_BLOCKSIZE];
+				int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+				num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
+
+				// bitmap에서 0이 3개 이상인지 확인한다.
+				int temp_idx[3] = {0, 0, 0};
+				int last_temp = 0;
+
 				int count = 0;
 				int i;
-				for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !temp_idx; i++)
+				for(i = 0; i < num_bitmap && count < spb.sp_nblocks && last_temp != 3; i++)
 				{
 					disk_read(temp_bit, 2 + i);
 					int j;
-					for(j = 0; j < 512 && count < spb.sp_nblocks && !temp_idx; j++)
+					for(j = 0; j < 512 && count < spb.sp_nblocks && last_temp != 3; j++)
 					{
 						int k;
-						for(k = 0; k < 8 && count < spb.sp_nblocks && !temp_idx; k++)
+						for(k = 0; k < 8 && count < spb.sp_nblocks && last_temp != 3; k++)
 						{
-							if(count == free_idx[1] + 1)
+							if(!BIT_CHECK(temp_bit[j], k))
 							{
-								temp_idx = count;
-								BIT_SET(temp_bit[j], k);
-								disk_write(temp_bit, 2 + i);
+								if(!temp_idx[0])
+								{
+									temp_idx[0] = count;
+									last_temp++;
+								}
 
-								int temp = temp_idx;
-								temp_idx = free_idx[0];
-								free_idx[0] = free_idx[1];
-								free_idx[1] = temp;
+								else if(!temp_idx[1])
+								{
+									temp_idx[1] = count;
+									last_temp++;
+								}
+
+								else if(!temp_idx[2])
+								{
+									temp_idx[2] = count;
+									last_temp++;
+								}
 							}
 							count++;
 						}
 					}
 				}
 
+				// block이 꽉 찬 경우
+				if(!temp_idx[0] || !temp_idx[1] ||!temp_idx[2])
+				{
+					error_message("mkdir", org_path, -4);
+					return;
+				}
+
+				else
+				{
+					// 할당할 block의 bitmap의 bit 정보 1로 바꿔주기
+					int count = 0;
+					int last_temp = 0;
+					for(i = 0; i < num_bitmap && count < spb.sp_nblocks && last_temp != 3; i++)
+					{
+						disk_read(temp_bit, 2 + i);
+						int j;
+						for(j = 0; j < 512 && count < spb.sp_nblocks && last_temp != 3; j++)
+						{
+							int k;
+							for(k = 0; k < 8 && count < spb.sp_nblocks && last_temp != 3; k++)
+							{
+								if(count == temp_idx[0])
+								{
+									BIT_SET(temp_bit[j], k);
+									disk_write(temp_bit, 2 + i);
+									last_temp++;
+								}
+
+								else if(count == temp_idx[1])
+								{
+									BIT_SET(temp_bit[j], k);
+									disk_write(temp_bit, 2 + i);
+									last_temp++;
+								}
+
+								else if(count == temp_idx[2])
+								{
+									BIT_SET(temp_bit[j], k);
+									disk_write(temp_bit, 2 + i);
+									last_temp++;
+								}
+								count++;
+							}
+						}
+					}
+				}
+				
+				free_idx[0] = temp_idx[1];
+				free_idx[1] = temp_idx[2];
+
 				// 찾은 block idx를 새로운 dir ptr block으로 할당
-				parent_inode.sfi_direct[inode_direct_idx] = temp_idx;
+				parent_inode.sfi_direct[inode_direct_idx] = temp_idx[0];
 				disk_write(&parent_inode, sd_cwd.sfd_ino);
+			}
+
+			else if(parent_inode.sfi_size % 512 != 0)
+			{
+				char temp_bit[SFS_BLOCKSIZE];
+				int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+				num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
+
+				// 할당한 bitmap의 bit 정보 1로 바꿔주기
+				int count = 0;
+				int last_temp = 0;
+				int i;
+				for(i = 0; i < num_bitmap && count < spb.sp_nblocks && last_temp != 2; i++)
+				{
+					disk_read(temp_bit, 2 + i);
+					int j;
+					for(j = 0; j < 512 && count < spb.sp_nblocks && last_temp != 2; j++)
+					{
+						int k;
+						for(k = 0; k < 8 && count < spb.sp_nblocks && last_temp != 2; k++)
+						{
+							if(count == free_idx[0])
+							{
+								BIT_SET(temp_bit[j], k);
+								disk_write(temp_bit, 2 + i);
+								last_temp++;
+							}
+
+							else if(count == free_idx[1])
+							{
+								BIT_SET(temp_bit[j], k);
+								disk_write(temp_bit, 2 + i);
+								last_temp++;
+							}
+							count++;
+						}
+					}
+				}
 			}
 
 			struct sfs_dir new_dir[SFS_DENTRYPERBLOCK];	// 새로운 dir entry 할당할 변수
@@ -581,41 +852,6 @@ void sfs_mkdir(const char* org_path)
 					//strcpy(temp_block[j].sfd_name, '\0');
 				}
 				disk_write(temp_block, new_inode.sfi_direct[i]);
-			}
-			
-
-			// 할당한 bitmap의 bit 정보 1로 바꿔주기
-			int count = 0;
-			free_idx[0] = 0;
-			free_idx[1] = 0;
-			for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !free_idx[1]; i++)
-			{
-				disk_read(temp_bit, 2 + i);
-				int j;
-				for(j = 0; j < 512 && count < spb.sp_nblocks && !free_idx[1]; j++)
-				{
-					int k;
-					for(k = 0; k < 8 && count < spb.sp_nblocks && !free_idx[1]; k++)
-					{
-						if(!BIT_CHECK(temp_bit[j], k))
-						{
-							if(!free_idx[0])
-							{
-								free_idx[0] = count;
-								BIT_SET(temp_bit[j], k);
-								disk_write(temp_bit, 2 + i);
-							}
-							
-							else if(!free_idx[1])
-							{
-								free_idx[1] = count;
-								BIT_SET(temp_bit[j], k);
-								disk_write(temp_bit, 2 + i);
-							}
-						}
-						count++;
-					}
-				}
 			}
 		}
 	}
@@ -783,7 +1019,7 @@ void sfs_mv(const char* src_name, const char* dst_name) // strcpy? strncpy??/ st
 	}
 }
 
-void sfs_rm(const char* path) //touch 구현하고 확인해야할듯..?
+void sfs_rm(const char* path)
 {
 	int rm_idx = 0;
 	int found_token = 0;
@@ -792,45 +1028,237 @@ void sfs_rm(const char* path) //touch 구현하고 확인해야할듯..?
 	disk_read(&temp_inode, sd_cwd.sfd_ino);
 	struct sfs_dir temp_dir[SFS_DENTRYPERBLOCK];
 
-	while(temp_inode.sfi_direct[i] != 0 && !found_token)
+	// search in direct ptr array
+	while(i < SFS_NDIRECT && !found_token)
 	{
-		// block access
-		disk_read(temp_dir, temp_inode.sfi_direct[i]);
-
-		// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
-		int j;
-		for(j = 0; j < SFS_DENTRYPERBLOCK && !found_token; j++)
+		if(temp_inode.sfi_direct[i] != 0 && !found_token)
 		{
-			// 찾은 경우
-			if(!strcmp(temp_dir[j].sfd_name, path))
+			// block access
+			disk_read(temp_dir, temp_inode.sfi_direct[i]);
+
+			// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
+			int j;
+			for(j = 0; j < SFS_DENTRYPERBLOCK && !found_token; j++)
 			{
-				struct sfs_inode is_if_file;
-				disk_read(&is_if_file, temp_dir[j].sfd_ino);
-
-				// file인 경우 dir entry에서 삭제
-				if(is_if_file.sfi_type == SFS_TYPE_FILE)
+				// 찾은 경우
+				if(!strcmp(temp_dir[j].sfd_name, path) && temp_dir[j].sfd_ino)
 				{
-					found_token = 1;
-					rm_idx = temp_dir[j].sfd_ino;
-					temp_dir[j].sfd_ino = 0;
-					//temp_dir[j].sfd_name = "";
-					disk_write(temp_dir, temp_inode.sfi_direct[i]);
-				}
+					struct sfs_inode is_if_file;
+					disk_read(&is_if_file, temp_dir[j].sfd_ino);
 
-				// dir인 경우 : [error] Is a directory
-				else
-				{
-					error_message("rm", path, -9);
-					return;
+					// file인 경우 dir entry에서 삭제
+					if(is_if_file.sfi_type == SFS_TYPE_FILE)
+					{
+						found_token = 1;
+						rm_idx = temp_dir[j].sfd_ino;
+						//bzero(&temp_dir[j], sizeof(struct sfs_dir));
+						temp_dir[j].sfd_ino = SFS_NOINO;
+
+						disk_write(temp_dir, temp_inode.sfi_direct[i]);
+
+						//부모노드 size 재조정
+						temp_inode.sfi_size -= sizeof(struct sfs_dir);
+						disk_write(&temp_inode, sd_cwd.sfd_ino);
+					}
+
+					// dir인 경우 : [error] Is a directory
+					else
+					{
+						error_message("rm", path, -9);
+						return;
+					}
 				}
 			}
 		}
 		i++;
 	}
 
+	// search in indirect ptr array
+	if(!found_token && temp_inode.sfi_indirect)
+	{
+		u_int32_t dir_ptr[SFS_DBPERIDB];
+
+		disk_read(dir_ptr, temp_inode.sfi_indirect);
+
+		int i;
+		for(i = 0; i < SFS_DBPERIDB && !found_token; i++)
+		{
+			struct sfs_dir temp_dir[SFS_DENTRYPERBLOCK];
+			disk_read(temp_dir, dir_ptr[i]);
+
+			// 해당 block의 direct ptr array 접근하여 하위 폴더 및 파일명 탐색
+			int j;
+			for(j = 0; j < SFS_DENTRYPERBLOCK && !found_token; j++)
+			{
+				// 찾은 경우
+				if(!strcmp(temp_dir[j].sfd_name, path) && temp_dir[j].sfd_ino)
+				{
+					struct sfs_inode is_if_file;
+					disk_read(&is_if_file, temp_dir[j].sfd_ino);
+
+					// file인 경우 dir entry에서 삭제
+					if(is_if_file.sfi_type == SFS_TYPE_FILE)
+					{
+						found_token = 1;
+						rm_idx = temp_dir[j].sfd_ino;
+						//bzero(&temp_dir[j], sizeof(struct sfs_dir));
+						temp_dir[j].sfd_ino = SFS_NOINO;
+						disk_write(temp_dir, dir_ptr[i]);
+
+						//부모노드 size 재조정
+						temp_inode.sfi_size -= sizeof(struct sfs_dir);
+						disk_write(&temp_inode, sd_cwd.sfd_ino);
+
+						//indirect 초기화
+						//bzero(&dir_ptr[i], sizeof(u_int32_t));
+						dir_ptr[i] = 0;
+						disk_write(dir_ptr, temp_inode.sfi_indirect);
+					}
+
+					// dir인 경우 : [error] Is a directory
+					else
+					{
+						error_message("rm", path, -9);
+						return;
+					}
+				}
+			}
+		}
+	}
+
 	if(found_token)
 	{
-		//bitmap 해제
+		// inode 초기화
+		struct sfs_inode rm_inode;
+		disk_read(&rm_inode, rm_idx);
+
+		// 삭제할 inode에 dir block이 할당되어 있다면 dir block 삭제
+		if(rm_inode.sfi_size != 0)
+		{
+			/*
+			int rm_dir_idx = rm_inode.sfi_direct[0];
+			struct sfs_dir rm_dir[SFS_DENTRYPERBLOCK];
+			disk_read(rm_dir, rm_dir_idx);
+			//bzero(rm_dir, sizeof(struct sfs_dir));
+			rm_dir[0].sfd_ino = SFS_NOINO;
+			disk_write(rm_dir, rm_dir_idx);
+			*/
+			int s;
+			for(s = 0; s < 15; s++)
+			{
+				
+				int rm_dir_idx = rm_inode.sfi_direct[s];
+				rm_inode.sfi_direct[s] = SFS_NOINO;
+
+				if(rm_dir_idx)
+				{
+					// 삭제한 dir block에 해당하는 bitmap 해제
+					char temp_bit[SFS_BLOCKSIZE];
+					int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+					num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
+
+					int temp_token = 0;
+					int count = 0;
+					for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !temp_token; i++)
+					{
+						disk_read(temp_bit, 2 + i);
+						int j;
+						for(j = 0; j < 512 && count < spb.sp_nblocks && !temp_token; j++)
+						{
+							int k;
+							for(k = 0; k < 8 && count < spb.sp_nblocks && !temp_token; k++)
+							{
+								if(count == rm_dir_idx)
+								{
+									BIT_CLEAR(temp_bit[j], k);
+									temp_token = 1;
+									disk_write(temp_bit, 2 + i);
+								}
+
+								count++;
+							}
+						}
+					}
+				}
+			}
+			if(rm_inode.sfi_indirect)
+			{
+				u_int32_t dir_ptr[SFS_DBPERIDB];
+				disk_read(dir_ptr, rm_inode.sfi_indirect);
+
+				int p;
+				for(p = 0; p < SFS_DBPERIDB; p++)
+				{
+					if(dir_ptr[p])
+					{
+						// 해당하는 bitmap 해제
+						char temp_bit[SFS_BLOCKSIZE];
+						int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+						num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
+
+						int temp_token = 0;
+						int count = 0;
+						for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !temp_token; i++)
+						{
+							disk_read(temp_bit, 2 + i);
+							int j;
+							for(j = 0; j < 512 && count < spb.sp_nblocks && !temp_token; j++)
+							{
+								int k;
+								for(k = 0; k < 8 && count < spb.sp_nblocks && !temp_token; k++)
+								{
+									if(count == dir_ptr[p])
+									{
+										BIT_CLEAR(temp_bit[j], k);
+										temp_token = 1;
+										disk_write(temp_bit, 2 + i);
+									}
+
+									count++;
+								}
+							}
+						}
+					}
+				}
+
+				// 해당하는 bitmap 해제
+				char temp_bit[SFS_BLOCKSIZE];
+				int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
+				num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
+
+				int temp_token = 0;
+				int count = 0;
+				for(i = 0; i < num_bitmap && count < spb.sp_nblocks && !temp_token; i++)
+				{
+					disk_read(temp_bit, 2 + i);
+					int j;
+					for(j = 0; j < 512 && count < spb.sp_nblocks && !temp_token; j++)
+					{
+						int k;
+						for(k = 0; k < 8 && count < spb.sp_nblocks && !temp_token; k++)
+						{
+							if(count == rm_inode.sfi_indirect)
+							{
+								BIT_CLEAR(temp_bit[j], k);
+								temp_token = 1;
+								disk_write(temp_bit, 2 + i);
+							}
+
+							count++;
+						}
+					}
+				}
+			}
+
+			rm_inode.sfi_indirect = SFS_NOINO;
+			disk_write(&rm_inode, rm_idx);
+		}
+
+
+		//bzero(&rm_inode, SFS_BLOCKSIZE);
+		//disk_write(&rm_inode, rm_idx);
+
+		// 삭제한 inode에 해당하는 bitmap 해제
 		char temp_bit[SFS_BLOCKSIZE];
 		int num_bitmap = SFS_BITMAPSIZE(spb.sp_nblocks);
 		num_bitmap = SFS_BITBLOCKS(spb.sp_nblocks);
@@ -856,14 +1284,8 @@ void sfs_rm(const char* path) //touch 구현하고 확인해야할듯..?
 				}
 			}
 		}
-
-		//inode 삭제
-		struct sfs_inode rm_inode;
-		disk_read(&rm_inode, rm_idx);
-		rm_inode.sfi_type = SFS_TYPE_INVAL;
-		disk_write(&rm_inode, rm_idx);
 	}
-
+	// 삭제할 file이 존재하지 않는 경우 : [error] No such file or directory
 	else
 		error_message("rm", path, -1);
 }
